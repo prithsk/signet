@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify a Signet-sealed PDF with no Signet code and no network.
 
-Usage: python verify_offline.py completed.pdf <vendor_public_key_b64 | path/to/signet-key.json>
+Usage: python verify_offline.py completed.pdf <vendor_public_key_b64 | path/to/signet-key.json> [transparency.log]
        (fetch the json from https://<vendor>/.well-known/signet-key and keep a copy you trust)
 Deps:  pip install pypdf cryptography
 """
@@ -36,6 +36,15 @@ if pages != rec["page_content_sha256"]: fail("visible pages edited after sealing
 if pub_b64 is None or rec["public_key"] != pub_b64: fail("document key is not a key you trust")
 unsigned = {k: v for k, v in rec.items() if k != "signature"}
 Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64)).verify(base64.b64decode(rec["signature"]), canon(unsigned))
+if len(sys.argv) > 3:
+    lines = [json.loads(l) for l in open(sys.argv[3]) if l.strip()]
+    prev = "0" * 64
+    for i, e in enumerate(lines):
+        body = {k: e[k] for k in ("seq", "ts", "envelope_id", "root_hash", "key_id")}
+        if e["seq"] != i or e["prev"] != prev or e["hash"] != h(prev.encode() + canon(body)): fail(f"transparency log broken at {i}")
+        prev = e["hash"]
+    if not any(e["root_hash"] == rec["root_hash"] for e in lines): fail("root hash not in transparency log")
+    print("transparency log: intact, root hash present")
 print("OK  envelope", rec["envelope_id"], "root", rec["root_hash"][:16])
 for ev in rec["events"]:
     print(f"  {ev['ts']}  {ev['type']:<10} {ev['actor']}")

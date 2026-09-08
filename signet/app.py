@@ -28,9 +28,10 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from . import core
+from . import core, transparency
 from .outbox import Mail, make_outbox
 from .pages import OTP_HTML, SIGN_HTML
+from .ratelimit import RateLimiter
 
 DATA = Path(os.environ.get("SIGNET_DATA", "data"))
 API_KEY = os.environ.get("SIGNET_APIKEY", "")
@@ -80,6 +81,11 @@ def rotate_key() -> str:
 
 KEYRING = load_keyring()
 OUTBOX = make_outbox()
+LIMITER = RateLimiter()
+TLOG = DATA / "transparency.log"
+RATE_ENVELOPES = int(os.environ.get("SIGNET_RATE_ENVELOPES", "120"))  # per api key per minute
+RATE_OTP = int(os.environ.get("SIGNET_RATE_OTP", "20"))  # per ip per minute
+RATE_VERIFY = int(os.environ.get("SIGNET_RATE_VERIFY", "60"))  # per ip per minute
 
 SCHEMA = """
 create table if not exists envelopes (
@@ -122,6 +128,17 @@ app = FastAPI(title="Signet")
 def require_key(x_api_key: str | None):
     if not x_api_key or not hmac.compare_digest(x_api_key.encode(), API_KEY.encode()):
         raise HTTPException(401, "bad api key")
+
+
+def client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+@app.get("/health")
+def health():
+    with db() as c:
+        c.execute("select 1")
+    return {"ok": True, "active_key_id": KEYRING.active_id, "transparency_entries": sum(1 for _ in TLOG.open()) if TLOG.exists() else 0}
 
 
 def webhook_url_problem(url: str) -> str | None:
@@ -209,6 +226,7 @@ async def create_envelope(
 ):
     """signers: JSON list of {email, placements:[{page,x,y,w,h}]}."""
     require_key(x_api_key)
+    LIMITER.check("envelopes:" + core.sha256(x_api_key.encode())[:16], RATE_ENVELOPES, 60)
     try:
         signer_list = json.loads(signers)
         assert isinstance(signer_list, list) and 0 < len(signer_list) <= 50
@@ -394,6 +412,7 @@ def sign_page(token: str, request: Request):
 
 @app.post("/sign/{token}/otp")
 async def sign_otp(token: str, request: Request):
+    LIMITER.check("otp:" + client_ip(request), RATE_OTP, 60)
     body = await request.json()
     code = str(body.get("code", "")).strip()
     with db() as c:
@@ -464,6 +483,7 @@ async def sign_submit(token: str, request: Request, background: BackgroundTasks)
         pngs = [r["image"] for r in rows]
         placements = [[core.Placement(**p) for p in json.loads(r["placements_json"])] for r in rows]
         pdf = core.seal(env["id"], env["original"], pngs, placements, chain, KEYRING.active)
+        transparency.append(TLOG, env["id"], chain.root_hash, KEYRING.active_id)
         c.execute("insert or replace into completed values (?,?)", (env["id"], pdf))
         c.execute("update envelopes set status='completed' where id=?", (env["id"],))
         save_chain(c, env["id"], chain)
@@ -486,13 +506,27 @@ def well_known_key():
     }
 
 
+@app.get("/transparency.log")
+def transparency_log():
+    return Response(TLOG.read_bytes() if TLOG.exists() else b"", media_type="application/x-ndjson")
+
+
 @app.post("/verify")
-async def verify_endpoint(file: UploadFile = File(...)):
-    pdf = await file.read()
+async def verify_endpoint(request: Request, file: UploadFile = File(...)):
+    LIMITER.check("verify:" + client_ip(request), RATE_VERIFY, 60)
+    pdf = await file.read(MAX_UPLOAD + 1)
+    if len(pdf) > MAX_UPLOAD:
+        raise HTTPException(413, "file too large")
     r = core.verify(pdf, KEYRING.trusted())
     body = {"ok": r.ok, "reason": r.reason}
     if r.record:
         body["envelope_id"] = r.record.get("envelope_id")
         body["key_id"] = r.record.get("key_id")
         body["events"] = r.record.get("events")
+        if r.ok:
+            logged = TLOG.exists() and transparency.contains(TLOG.read_text(), r.record["root_hash"])
+            body["in_transparency_log"] = bool(logged)
+            if not logged:
+                body["ok"], body["reason"] = False, "seal valid but root hash is not in the transparency log"
+                return JSONResponse(body, status_code=400)
     return JSONResponse(body, status_code=200 if r.ok else 400)

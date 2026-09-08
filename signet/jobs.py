@@ -28,6 +28,36 @@ def prune_otps() -> int:
         return cur.rowcount
 
 
+def backup() -> str:
+    """Tar the database and keys into SIGNET_BACKUP_DIR (default data/backups). Returns path."""
+    import os
+    import tarfile
+    from pathlib import Path
+
+    from .app import DATA, KEYS_DIR, DB_PATH, TLOG
+
+    out_dir = Path(os.environ.get("SIGNET_BACKUP_DIR", DATA / "backups"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"signet-{now().strftime('%Y%m%dT%H%M%SZ')}.tar.gz"
+    with tarfile.open(out, "w:gz") as t:
+        t.add(DB_PATH, arcname="signet.db")
+        t.add(KEYS_DIR, arcname="keys")
+        if TLOG.exists():
+            t.add(TLOG, arcname="transparency.log")
+    return str(out)
+
+
+def check_transparency() -> str:
+    """Verify the local transparency log chain. Exit non-zero from cron if broken."""
+    from .app import TLOG
+    from .transparency import verify_log
+
+    reason = verify_log(TLOG.read_text()) if TLOG.exists() else None
+    if reason:
+        sys.exit(reason)
+    return "ok"
+
+
 if __name__ == "__main__":
     job = sys.argv[1] if len(sys.argv) > 1 else "expire"
-    print({"expire": expire, "prune_otps": prune_otps}[job]())
+    print({"expire": expire, "prune_otps": prune_otps, "backup": backup, "check_transparency": check_transparency}[job]())

@@ -55,11 +55,15 @@ any page size.
 - `/verify` endpoint, `/.well-known/signet-key`, and `verify_offline.py` (no Signet code)
 - Signed webhooks on completion (HMAC-SHA256 header, 3 attempts, deliveries logged)
 - Email outbox: `SIGNET_MAIL=memory|log|smtp`
-- Cron jobs: `python -m signet.jobs expire` and `prune_otps`
+- Transparency log: every sealed root hash appended to a chained, public `/transparency.log`;
+  `/verify` rejects a valid seal whose root is not in the log; `scripts/publish_transparency.sh`
+  mirrors it to a public git repo and refuses to push if the log was rewritten
+- In-app rate limits on envelope creation (per key), OTP attempts and verify (per IP)
+- `/health`, nightly cron (expire, prune OTPs, check log chain, backup), Docker + Caddy TLS
 
 ## Verification signal
 
-`pytest` runs 35 tests, and CI runs them on every push. The ones that matter:
+`pytest` runs 39 tests, and CI runs them on every push. The ones that matter:
 
 - sealed PDF verifies with the right key and fails with the wrong one
 - editing the audit record, swapping the original, swapping a signature image, drawing on a
@@ -84,6 +88,19 @@ counter (lockout never fired). Both are the reason the tests exist.
 
 See `docs/AUDIT_SPEC.md` for exactly what is and is not proven.
 
+## Deploy
+
+```
+cp .env.example .env    # fill in SIGNET_APIKEY, domain, SMTP
+cd deploy && docker compose up -d --build
+curl https://$SIGNET_DOMAIN/health
+```
+
+Caddy gets a TLS cert automatically and caps request bodies. Uvicorn trusts forwarded headers
+only from the compose network, so audit IPs are the real client. The `cron` service runs the
+nightly jobs against the same volume. On the host, add a cron line for
+`scripts/publish_transparency.sh` so the log lives somewhere you cannot edit.
+
 ## Next signal
 
 Five developers integrate against a hosted sandbox. Metric: minutes from API key to first
@@ -91,10 +108,10 @@ verified completed PDF. Failures in that hour are the roadmap.
 
 ## What this does not do yet, on purpose
 
-Templates, field types beyond signature (date, initials, text), a sender dashboard, and a
-transparency log of root hashes. Templates and dashboard wait for sandbox data: build what
-five developers ask for, not what a feature list says. The transparency log is the next
-piece of the moat and should come before any paying customer.
+Templates, field types beyond signature (date, initials, text), and a sender dashboard. Templates and dashboard wait for sandbox data: build what
+five developers ask for, not what a feature list says. The log exists now; what is
+missing is a second, independent mirror (an object store with versioning, or a
+witness run by someone who is not you).
 
 Nothing here is a claim of ESIGN or eIDAS compliance. Get a lawyer to read `AUDIT_SPEC.md`
 before saying that word to a customer.
@@ -106,10 +123,10 @@ bombing through a signing link (single live code), SSRF through webhooks, oversi
 uploads, clickjacking of the sign page, timing attacks on the API key.
 
 Threats not handled: an attacker who reads the signer's email can sign as them (that is
-true of every e-signature product using email OTP), a compromised server can seal anything
-(the transparency log fixes this), and there is no per-key rate limit on `/envelopes` or on
-`/verify`, so put those behind your proxy's rate limiter. `request.client.host` is the
-proxy's address unless you configure forwarded headers.
+true of every e-signature product using email OTP). A compromised server can still seal a
+document, but not without appending to the public log, so forgery leaves evidence unless the
+attacker also controls the mirror. Rate limits are per process; if you run more than one
+replica, move them to Redis or the proxy.
 
 ## Maintenance this now requires
 
@@ -119,8 +136,11 @@ proxy's address unless you configure forwarded headers.
 - The page content hash depends on pypdf's content stream handling staying stable across
   versions. Pin pypdf, and add a fixture of a sealed PDF plus its expected hashes so an
   upgrade that changes behavior fails CI.
-- Cron, nightly, with the same env as the server:
-  `python -m signet.jobs expire && python -m signet.jobs prune_otps`
+- Nightly jobs run in the `cron` container. Watch its logs for "TRANSPARENCY LOG BROKEN".
+- Backups land in `/data/backups` inside the volume. Copy them off the box; a backup on the
+  same disk as the thing it backs up is a wish, not a backup.
+- The transparency mirror repo is now part of the product. If the publish script ever refuses
+  to push, stop and find out why before anything else.
 - Webhook delivery runs in-process. If the box restarts mid-delivery it is lost; the
   `webhook_deliveries` table shows the gap. Move to a queue once anyone depends on it.
 - The OTP code goes over email in plain text. That is standard, but the mail provider

@@ -28,6 +28,13 @@ H = {"x-api-key": "test-key"}
 OUT = appmod.OUTBOX
 
 
+@pytest.fixture(autouse=True)
+def _reset_limiter():
+    appmod.LIMITER._hits.clear()
+    yield
+    appmod.LIMITER._hits.clear()
+
+
 def create(signers, **extra):
     data = {"signers": json.dumps(signers), "title": "Test Agreement", **extra}
     return client.post("/envelopes", headers=H, files={"file": ("a.pdf", make_pdf(), "application/pdf")}, data=data)
@@ -364,3 +371,62 @@ def test_public_url_used_for_links(monkeypatch):
     monkeypatch.setattr(appmod, "PUBLIC_URL", "https://sign.example.com")
     r = create([{"email": "u@x.com", "placements": []}])
     assert r.json()["signing_links"][0]["url"].startswith("https://sign.example.com/sign/")
+
+
+# ------------------------------------------------------------ rate limits, transparency, ops
+
+
+def test_rate_limit_otp(monkeypatch):
+    monkeypatch.setattr(appmod, "RATE_OTP", 3)
+    r = create([{"email": "rl@x.com", "placements": []}])
+    tok = token_of(r.json()["signing_links"][0])
+    client.get(f"/sign/{tok}")
+    codes = [client.post(f"/sign/{tok}/otp", json={"code": "000000"}).status_code for _ in range(4)]
+    assert codes == [401, 401, 401, 429]
+
+
+def test_rate_limit_envelopes(monkeypatch):
+    monkeypatch.setattr(appmod, "RATE_ENVELOPES", 2)
+    codes = [create([{"email": "rle@x.com", "placements": []}]).status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+
+
+def test_transparency_log_chained_and_checked_by_verify():
+    from signet import transparency
+
+    r = create([{"email": "t@x.com", "placements": []}])
+    env_id, tok = r.json()["envelope_id"], token_of(r.json()["signing_links"][0])
+    verify_identity(tok, "t@x.com")
+    client.post(f"/sign/{tok}", json={"typed": "T"})
+    log = client.get("/transparency.log").text
+    assert transparency.verify_log(log) is None
+    root = client.get(f"/envelopes/{env_id}", headers=H).json()["events"][-1]["hash"]
+    assert transparency.contains(log, root)
+
+    pdf = client.get(f"/envelopes/{env_id}/completed.pdf", headers=H).content
+    r = client.post("/verify", files={"file": ("c.pdf", pdf, "application/pdf")})
+    assert r.json()["ok"] and r.json()["in_transparency_log"]
+
+    # a valid seal whose root is missing from the log is rejected: forged-by-insider scenario
+    saved = appmod.TLOG.read_text()
+    appmod.TLOG.write_text("")
+    r = client.post("/verify", files={"file": ("c.pdf", pdf, "application/pdf")})
+    assert r.status_code == 400 and "transparency" in r.json()["reason"]
+    appmod.TLOG.write_text(saved)
+
+    # tampered log is detected
+    bad = saved.replace('"envelope_id":"' + env_id, '"envelope_id":"env_x')
+    assert transparency.verify_log(bad) is not None
+
+
+def test_health_backup_and_log_check(tmp_path, monkeypatch):
+    from signet import jobs
+
+    assert client.get("/health").json()["ok"]
+    monkeypatch.setenv("SIGNET_BACKUP_DIR", str(tmp_path))
+    out = jobs.backup()
+    import tarfile
+
+    names = tarfile.open(out).getnames()
+    assert "signet.db" in names and any(n.startswith("keys/") and n.endswith(".pem") for n in names) and "transparency.log" in names
+    assert jobs.check_transparency() == "ok"

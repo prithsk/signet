@@ -1,0 +1,45 @@
+services:
+  signet:
+    build: ..
+    env_file: ../.env
+    volumes:
+      - signet-data:/data
+    restart: unless-stopped
+    networks: [internal]
+
+  caddy:
+    image: caddy:2
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    environment:
+      - SIGNET_DOMAIN=${SIGNET_DOMAIN}
+    restart: unless-stopped
+    networks: [internal]
+
+  cron:
+    build: ..
+    env_file: ../.env
+    volumes:
+      - signet-data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    # nightly: expire links, clear stale codes, verify the log chain, tar a backup
+    command:
+      - |
+        while true; do
+          python -m signet.jobs expire
+          python -m signet.jobs prune_otps
+          python -m signet.jobs check_transparency || echo "TRANSPARENCY LOG BROKEN" >&2
+          python -m signet.jobs backup
+          sleep 86400
+        done
+    restart: unless-stopped
+    networks: [internal]
+
+volumes:
+  signet-data:
+  caddy-data:
+
+networks:
+  internal:
