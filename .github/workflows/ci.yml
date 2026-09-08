@@ -1,0 +1,23 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get install -y fonts-dejavu-core
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+      - name: offline verifier smoke
+        run: |
+          python - <<'PY'
+          from signet.core import *
+          from tests.test_core import make_pdf, make_png
+          k=generate_key(); ch=AuditChain(); ch.append("created","ci")
+          png=make_png(); ch.append("signed","ci",{"signer_index":0,"image_sha256":sha256(png),"placements":[]})
+          open("ci.pdf","wb").write(seal("ci",make_pdf(),[png],[[Placement(0,.1,.1,.2,.05)]],ch,k))
+          open("key.txt","w").write(public_key_b64(k))
+          PY
+          python verify_offline.py ci.pdf "$(cat key.txt)"

@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+httpx
+pypdf==5.9.0
+reportlab
+cryptography
+pillow
+pytest
